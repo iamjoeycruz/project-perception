@@ -31,14 +31,19 @@ access and group-based protections; this is not a blanket exclusion policy.
 PREREQUISITES AND AUTHORIZATION
 If no Graph connection exists, the script starts interactive sign-in with
 Connect-MgGraph using process-scoped authentication in the Global environment.
+The interactive menu requests Group.ReadWrite.All at the first sign-in so
+preview and a later approved Apply can reuse the same connection. Preview
+remains read-only; no changes occur until Apply is selected and confirmed.
+Preview-only runs using -NoMenu, -PassThru, or -WhatIf request Group.Read.All.
+-Apply requires write permission unless -WhatIf is set.
 Supply -TenantId to target a specific tenant; otherwise select the intended
 account during sign-in and review the connected tenant in the output.
 Existing connections are reused, not silently switched or upgraded. Explicitly
 choosing apply in the menu can request a write-permission connection.
 Initial sign-in calls Connect-MgGraph only when no connection exists.
 Microsoft sign-in can display multiple screens for account
-selection, consent, MFA, or Conditional Access. Preview followed by an explicit
-reconnection for write permission can also require another sign-in. These
+selection, consent, MFA, or Conditional Access. An existing read-only connection
+can still require another sign-in when Apply requests write permission. These
 requirements cannot be bypassed by this script.
 Preview requires
 Group.Read.All; applying requires Group.ReadWrite.All. Existing broader
@@ -86,7 +91,11 @@ One explicit retry layer handles 429 responses using Retry-After, or exponential
 backoff if absent. Transient GET errors can also retry. PATCH is automatically
 retried only for 429, after rechecking the original rule and processing state.
 SDK retries are disabled temporarily to avoid stacked retries; the prior SDK
-MaxRetry setting is restored on exit. Do not share this process concurrently
+MaxRetry setting is restored on exit. Nested menu actions reuse an already
+disabled retry setting without resetting the SDK's cached HTTP client.
+Apply displays per-group progress through approval, update, and read-back;
+the progress display is not evidence of membership-processing completion.
+Do not share this process concurrently
 with other Graph operations while running the script.
 Requests use relative SDK URIs to avoid the SDK's temporary cloud override.
 A known stale public-cloud override is repaired before changing retry settings;
@@ -265,10 +274,12 @@ $ErrorActionPreference = 'Stop'
 Write-Host 'EXPERIMENTAL SAMPLE - evaluation/testing only. AS IS; no warranties. Not production-ready.' -ForegroundColor Yellow
 $requiresWrite = $Apply -and -not $WhatIfPreference
 $requiredScope = if ($requiresWrite) { 'Group.ReadWrite.All' } else { 'Group.Read.All' }
+$interactiveApply = -not $NoMenu -and -not $PassThru -and -not $WhatIfPreference
+$signInScope = if ($requiresWrite -or $interactiveApply) { 'Group.ReadWrite.All' } else { 'Group.Read.All' }
 $context = Get-MgContext
 if (-not $context -or -not $context.TenantId) {
     $connectParameters = @{
-        Scopes = @($requiredScope)
+        Scopes = @($signInScope)
         ContextScope = 'Process'
         Environment = 'Global'
         NoWelcome = $true
@@ -277,8 +288,11 @@ if (-not $context -or -not $context.TenantId) {
     if ($PSBoundParameters.ContainsKey('TenantId')) {
         $connectParameters.TenantId = $TenantId.ToString()
     }
-    Write-Host "No Microsoft Graph connection found. Starting sign-in requesting '$requiredScope'. Admin consent may be required."
-    Write-Host 'Microsoft may display account selection, consent, and MFA screens. Initial sign-in starts once; choosing apply later may request write-permission sign-in.'
+    Write-Host "No Microsoft Graph connection found. Starting sign-in requesting '$signInScope'. Admin consent may be required."
+    if ($interactiveApply) {
+        Write-Host 'The interactive menu requests write permission now so preview and approved Apply can reuse one connection. Preview remains read-only; Apply still requires confirmation.' -ForegroundColor Yellow
+    }
+    Write-Host 'Microsoft may display account selection, consent, and MFA screens. The script cannot bypass authentication policy.'
     try {
         $null = Connect-MgGraph @connectParameters
     } catch {
@@ -440,7 +454,9 @@ function Invoke-GroupGraphRequest {
 $originalRequestContext = Get-MgRequestContext
 $originalMaxRetry = $originalRequestContext.MaxRetry
 try {
-$null = Set-MgRequestContext -MaxRetry 0 -WhatIf:$false -Confirm:$false
+if ($originalMaxRetry -ne 0) {
+    $null = Set-MgRequestContext -MaxRetry 0 -WhatIf:$false -Confirm:$false
+}
 $baseUri = 'https://graph.microsoft.com/v1.0/groups'
 $select = 'id,displayName,groupTypes,membershipRule,membershipRuleProcessingState'
 $discoveredGroups = [System.Collections.Generic.List[object]]::new()
@@ -596,6 +612,8 @@ function Write-GroupAuditRecord {
     $auditStream.Flush($true)
 }
 
+$applyCount = @($plan | Where-Object Status -eq 'Planned').Count
+$applyIndex = 0
 try {
 foreach ($item in $plan) {
     if ($item.Status -ne 'Planned') { continue }
@@ -603,6 +621,14 @@ foreach ($item in $plan) {
         $item.Status = 'Preview'
         continue
     }
+    $applyIndex++
+    $applyProgress = @{
+        Id = 1
+        Activity = 'Applying agent-user exclusions'
+        Status = "Group $applyIndex of ${applyCount}: $($item.DisplayName)"
+        PercentComplete = [int] (($applyIndex - 1) * 100 / $applyCount)
+    }
+    if ($requiresWrite) { Write-Progress @applyProgress -CurrentOperation 'Awaiting approval' }
     if (-not $PSCmdlet.ShouldProcess("$($item.DisplayName) [$($item.Id)]", 'Append agent-user exclusion to membershipRule')) {
         $item.Status = 'NotApplied'
         continue
@@ -644,6 +670,7 @@ foreach ($item in $plan) {
     $patchAccepted = $false
     try {
         Write-GroupAuditRecord -Status 'Attempting' -Item $item
+        Write-Progress @applyProgress -CurrentOperation 'Checking the current rule and processing state'
         $current = Invoke-GroupGraphRequest -Method GET -Uri "${uri}?`$select=$select" -Item $item
         if ($current.groupTypes -notcontains 'DynamicMembership' -or
             [string] $current.membershipRule -cne $item.OriginalRule -or
@@ -653,6 +680,7 @@ foreach ($item in $plan) {
         $body = @{ membershipRule = $item.ProposedRule } | ConvertTo-Json -Compress
         $patchFailure = $null
         try {
+            Write-Progress @applyProgress -CurrentOperation 'Submitting the rule update'
             $null = Invoke-GroupGraphRequest -Method PATCH -Uri $uri -Body $body -Item $item
             $patchAccepted = $true
         } catch {
@@ -661,6 +689,7 @@ foreach ($item in $plan) {
             Write-Warning "PATCH outcome uncertain for [$($item.Id)]. Reading current state before any further write."
             Write-GroupAuditRecord -Status 'Reconciling' -Item $item -HttpStatusCode $patchFailure.Data['HttpStatusCode'] -RequestId $patchFailure.Data['RequestId'] -ErrorMessage $patchFailure.Message
         }
+        Write-Progress @applyProgress -CurrentOperation 'Reading back and verifying the stored rule'
         $verified = Invoke-GroupGraphRequest -Method GET -Uri "${uri}?`$select=$select" -Item $item
         if ($verified.groupTypes -notcontains 'DynamicMembership' -or
             [string] $verified.membershipRule -cne $item.ProposedRule -or
@@ -697,6 +726,9 @@ foreach ($item in $plan) {
 }
 } finally {
     if ($auditStream) { $auditStream.Dispose() }
+    if ($requiresWrite -and $applyCount -gt 0) {
+        Write-Progress -Id 1 -Activity 'Applying agent-user exclusions' -Completed
+    }
 }
 foreach ($result in $plan) {
     $saved = $result.Status -in @('Updated', 'Unchanged')
@@ -1065,5 +1097,7 @@ if (-not $NoMenu -and -not $PassThru) {
     }
 }
 } finally {
-    $null = Set-MgRequestContext -MaxRetry $originalMaxRetry -WhatIf:$false -Confirm:$false
+    if ($originalMaxRetry -ne 0) {
+        $null = Set-MgRequestContext -MaxRetry $originalMaxRetry -WhatIf:$false -Confirm:$false
+    }
 }
