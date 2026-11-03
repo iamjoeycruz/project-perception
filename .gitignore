@@ -1,0 +1,29 @@
+# Generated tenant configuration, audits, and exports.
+*.json
+*.jsonl
+*.csv
+*.tsv
+*.log
+*.bak
+*.backup
+audit/
+audits/
+backup/
+backups/
+exports/
+reports/
+
+# Local credentials and settings.
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+*.kdbx
+.vscode/
+.idea/
+
+# Local OS files.
+Thumbs.db
+Desktop.ini
