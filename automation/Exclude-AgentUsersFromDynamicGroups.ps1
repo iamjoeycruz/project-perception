@@ -88,6 +88,9 @@ retried only for 429, after rechecking the original rule and processing state.
 SDK retries are disabled temporarily to avoid stacked retries; the prior SDK
 MaxRetry setting is restored on exit. Do not share this process concurrently
 with other Graph operations while running the script.
+Requests use relative SDK URIs to avoid the SDK's temporary cloud override.
+A known stale public-cloud override is repaired before changing retry settings;
+the connected tenant, authentication context, and permissions are unchanged.
 If a PATCH response is lost or returns a transient server error, read-back
 reconciles the outcome instead of blindly repeating the write. Only an exact
 dynamic-group rule/state match is considered verified; otherwise the run stops.
@@ -312,21 +315,46 @@ if ($requiresWrite) {
 }
 Write-Warning 'Confirm Entra support and validate representative human and agent accounts before applying. Coverage after parent identity or blueprint deletion is not established by this script.'
 
+$graphSession = [Microsoft.Graph.PowerShell.Authentication.GraphSession]::Instance
+$sdkEnvironment = $graphSession.Environment
+if ($sdkEnvironment -and $sdkEnvironment.Name -eq 'MSGraphInvokeGraphRequest') {
+    if (([string] $sdkEnvironment.GraphEndpoint).TrimEnd('/') -ine 'https://graph.microsoft.com') {
+        throw 'The SDK temporary environment does not match the public Graph endpoint. Reconnect explicitly to the intended Global tenant before running this script.'
+    }
+    $globalEnvironment = Get-MgEnvironment -Name Global
+    if (([string] $globalEnvironment.GraphEndpoint).TrimEnd('/') -ine 'https://graph.microsoft.com' -or
+        [string]::IsNullOrWhiteSpace($globalEnvironment.AzureADEndpoint)) {
+        throw 'Canonical Global SDK cloud metadata is unavailable. Repair the Graph SDK environment before running this script.'
+    }
+    # Absolute SDK requests can leave an override without an authentication endpoint.
+    $graphSession.Environment = $globalEnvironment
+    Write-Warning 'Repaired stale Graph SDK public-cloud metadata. The connected tenant, authentication context, and permissions are unchanged.'
+}
+
 $auditStream = $null
 $retryStatistics = [pscustomobject]@{ Count = 0 }
 function Invoke-GroupGraphRequest {
     param(
         [ValidateSet('GET', 'PATCH')]
         [string] $Method,
+        [ValidateNotNullOrEmpty()]
         [string] $Uri,
         [string] $Body,
         [object] $Item
     )
+    $absoluteUri = $null
+    if (-not [Uri]::TryCreate($Uri, [UriKind]::Absolute, [ref] $absoluteUri) -or
+        $absoluteUri.Scheme -ne 'https' -or $absoluteUri.Host -ine 'graph.microsoft.com' -or
+        -not $absoluteUri.IsDefaultPort -or $absoluteUri.UserInfo -or $absoluteUri.Fragment -or
+        $absoluteUri.AbsolutePath -notmatch '^/v1\.0/groups(?:/|$)') {
+        throw 'Unexpected Graph request URI. Only HTTPS requests to public Graph v1.0 groups are permitted. No request was sent.'
+    }
+    $relativeUri = [Uri]::new($absoluteUri.PathAndQuery.TrimStart('/'), [UriKind]::Relative)
     $timer = [Diagnostics.Stopwatch]::StartNew()
     $attempt = 0
     while ($true) {
         try {
-            $arguments = @{ Method = $Method; Uri = $Uri; OutputType = 'PSObject'; ErrorAction = 'Stop' }
+            $arguments = @{ Method = $Method; Uri = $relativeUri; OutputType = 'PSObject'; ErrorAction = 'Stop' }
             if ($Method -eq 'PATCH') {
                 $arguments.Body = $Body
                 $arguments.ContentType = 'application/json'
