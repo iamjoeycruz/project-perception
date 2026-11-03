@@ -938,7 +938,7 @@ if (-not $NoMenu -and -not $PassThru) {
         Write-Host ''
         Write-Host 'WHAT WOULD YOU LIKE TO DO NEXT?' -ForegroundColor Cyan
         Write-Host '  1  View all dynamic groups and full details (this tenant)'
-        Write-Host '  2  Apply exclusions to selected, approved group IDs'
+        Write-Host '  2  Apply all eligible groups or select from a numbered list'
         Write-Host '  3  Refresh saved-rule counts and completion guidance (current scope)'
         Write-Host '  4  Exit'
         $choice = Read-Host 'Enter 1, 2, 3, or 4'
@@ -959,28 +959,86 @@ if (-not $NoMenu -and -not $PassThru) {
         }
         if ($choice -eq '3' -and $GroupId) { $runParameters.GroupId = $GroupId }
         if ($choice -eq '2') {
-            $inputIds = Read-Host 'Enter approved group GUIDs separated by commas (blank cancels)'
+            $reviewParameters = $runParameters.Clone()
+            $reviewParameters.PassThru = $true
+            if ($GroupId) { $reviewParameters.GroupId = $GroupId }
+            $currentReview = @(& $PSCommandPath @reviewParameters)
+            $eligibleGroups = @($currentReview | Where-Object Status -eq 'Preview' | Sort-Object DisplayName, Id)
+            Write-Host "Current scope: $($currentReview.Count) groups reviewed; $($eligibleGroups.Count) eligible rule changes." -ForegroundColor Cyan
+            Write-Host 'Already-excluded, not-applicable, and manual-review groups are not included. Eligibility is checked again before applying.' -ForegroundColor Yellow
+            if ($eligibleGroups.Count -eq 0) {
+                Write-Host 'No eligible rule changes remain in this scope. No changes requested.' -ForegroundColor Gray
+                continue
+            }
+            Write-Host 'Enter ALL to apply to every eligible group in this scope, or LIST to choose groups by number. Group GUIDs are also accepted for groups in this review.' -ForegroundColor Cyan
+            $inputIds = Read-Host 'Enter ALL, LIST, or group GUIDs separated by commas (blank cancels)'
+            $numberSelection = $false
+            if ($inputIds -and $inputIds.Trim() -ieq 'LIST') {
+                $numberWidth = [Math]::Max(6, $eligibleGroups.Count.ToString().Length)
+                $selectionRows = @(
+                    for ($index = 0; $index -lt $eligibleGroups.Count; $index++) {
+                        [pscustomobject]@{
+                            Number = $index + 1
+                            Group = "$($eligibleGroups[$index].DisplayName)`n$($eligibleGroups[$index].Id)"
+                            Processing = $eligibleGroups[$index].ProcessingState
+                        }
+                    }
+                )
+                Write-ReportTable -Rows $selectionRows -Columns @(
+                    @{ Expression = 'Number'; Width = $numberWidth }
+                    @{ Expression = 'Group'; Width = [Math]::Max(12, $reportWidth - $numberWidth - 13) }
+                    @{ Expression = 'Processing'; Width = 10 }
+                )
+                $inputIds = Read-Host 'Enter numbers or ranges (for example 1,3-5), ALL, or blank to cancel'
+                $numberSelection = $true
+            }
             if ([string]::IsNullOrWhiteSpace($inputIds)) {
                 Write-Host 'Cancelled. No changes requested.' -ForegroundColor Gray
                 continue
             }
-            $selectedIds = [System.Collections.Generic.List[guid]]::new()
+            $selectedIds = [System.Collections.Generic.HashSet[guid]]::new()
+            $eligibleIds = [System.Collections.Generic.HashSet[guid]]::new()
+            foreach ($group in $eligibleGroups) { $null = $eligibleIds.Add([guid] $group.Id) }
             $validIds = $true
-            foreach ($value in ($inputIds -split ',')) {
-                $parsedId = [guid]::Empty
-                if (-not [guid]::TryParse($value.Trim(), [ref] $parsedId) -or $parsedId -eq [guid]::Empty) {
-                    $validIds = $false
-                    break
+            if ($inputIds.Trim() -ieq 'ALL') {
+                foreach ($id in $eligibleIds) { $null = $selectedIds.Add($id) }
+            } elseif ($numberSelection) {
+                foreach ($value in ($inputIds -split ',')) {
+                    if ($value.Trim() -notmatch '^(?<first>\d+)(?:\s*-\s*(?<last>\d+))?$') {
+                        $validIds = $false
+                        break
+                    }
+                    $first = 0
+                    $last = 0
+                    $lastText = if ($Matches.ContainsKey('last')) { $Matches.last } else { $Matches.first }
+                    if (-not [int]::TryParse($Matches.first, [ref] $first) -or
+                        -not [int]::TryParse($lastText, [ref] $last) -or
+                        $first -lt 1 -or $last -lt $first -or $last -gt $eligibleGroups.Count) {
+                        $validIds = $false
+                        break
+                    }
+                    for ($index = $first - 1; $index -lt $last; $index++) {
+                        $null = $selectedIds.Add([guid] $eligibleGroups[$index].Id)
+                    }
                 }
-                $selectedIds.Add($parsedId)
+            } else {
+                foreach ($value in ($inputIds -split ',')) {
+                    $parsedId = [guid]::Empty
+                    if (-not [guid]::TryParse($value.Trim(), [ref] $parsedId) -or
+                        -not $eligibleIds.Contains($parsedId)) {
+                        $validIds = $false
+                        break
+                    }
+                    $null = $selectedIds.Add($parsedId)
+                }
             }
-            if (-not $validIds) {
-                Write-Warning 'Invalid group ID list. Every entry must be a non-empty GUID. No changes were requested.'
+            if (-not $validIds -or $selectedIds.Count -eq 0) {
+                Write-Warning 'Invalid group selection. Use only numbers/ranges from the displayed list or GUIDs of eligible groups in this scope. No changes were requested.'
                 continue
             }
             $runParameters.Apply = $true
-            $runParameters.GroupId = $selectedIds.ToArray()
-            Write-Host 'Selected-group apply uses a new backup in the current directory and a new Desktop audit, unless custom destinations were supplied.' -ForegroundColor Yellow
+            $runParameters.GroupId = [guid[]] @($selectedIds)
+            Write-Host "Selected $($selectedIds.Count) eligible groups. Apply still requires approval/confirmation and uses a new backup and audit file." -ForegroundColor Yellow
             foreach ($pathName in @('BackupPath', 'AuditPath')) {
                 if ($PSBoundParameters.ContainsKey($pathName)) {
                     $originalPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($PSBoundParameters[$pathName])
