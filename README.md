@@ -117,6 +117,18 @@ automatically undo earlier verified changes.
 
 ## Parameters and reporting
 
+The interactive menu includes **Apply all eligible groups or select from a
+numbered list**. Choose that action, then enter `ALL`, `LIST`, or eligible
+group GUIDs. `LIST` shows names, IDs, and processing states; select numbers
+or ranges such as `1,3-5`. GUID entry is optional, not required.
+
+Eligibility is refreshed before each selection. `ALL` is restricted to groups
+found in the current invocation's scope (`-GroupId`, if supplied), not an
+unreviewed tenant-wide expansion. Already-excluded, not-applicable, and
+manual-review groups remain excluded. Invalid selections request no writes.
+Write authorization, backup/auditing, confirmation, and `-WhatIf` protections
+still apply.
+
 | Parameter | Purpose |
 | --- | --- |
 | None | Read-only summary with manual-review groups and explanations. |
