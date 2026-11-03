@@ -89,12 +89,27 @@ Existing Graph connections are validated, not silently switched or upgraded.
 Admin consent, MFA, Conditional Access, or explicit write-permission sign-in
 may be required.
 
+For preview followed by approved Apply through the interactive menu, omit
+`-NoMenu`. When disconnected, this mode requests `Group.ReadWrite.All` at
+the first sign-in, avoiding a second script-requested permission upgrade.
+The initial preview remains read-only, and Apply still requires confirmation.
+Preview-only `-NoMenu`, `-PassThru`, and `-WhatIf` runs request read permission
+instead. Existing read-only sessions may still require consent to upgrade.
+Microsoft MFA/Conditional Access can require further authentication; the
+sample does not bypass policy or guarantee one authentication prompt.
+Nested menu actions reuse an already-disabled SDK retry setting without
+unnecessarily resetting the cached HTTP client.
+
 ## Apply only to approved test groups
 
 Use an isolated test tenant or explicitly approved pilot groups. Validate
 representative human and agent accounts, including orphaned-account cases,
 and obtain change approval first. Apply changes actual group rules and can
 affect access, licensing, and security/compliance policy coverage.
+Apply shows per-group approval/update/read-back progress. Backup/audit path
+messages indicate file creation, not completion. The final summary and
+verified audit outcomes establish stored-rule updates, not completed
+membership recalculation.
 
 ```powershell
 # Establish the intended tenant and write scope explicitly.
