@@ -147,6 +147,23 @@ write replay. SDK retries are temporarily disabled and restored in `finally`.
 Do not run other Graph operations concurrently in the same PowerShell process.
 `-WhatIf` still adjusts/restores this local retry setting.
 
+### Invalid URI on a previously working connection
+
+Affected SDK versions can leave a temporary `MSGraphInvokeGraphRequest` cloud
+environment behind after absolute-URL requests, without its sign-in endpoint.
+Changing retry settings rebuilds the cached HTTP client and can expose that
+invalid state. This is different from an invalid group ID or rejected rule.
+
+The updated sample repairs this specific state only when it still targets
+public Graph, without changing authentication, tenant, or permissions.
+Requests are then passed to the SDK as relative URIs so they do not recreate
+the override. A temporary environment pointing elsewhere fails closed with
+reconnection guidance. Obtain the updated script before rerunning preview.
+
+Regression tests exercise the real SDK through a local fake HTTP transport,
+including stale cloud metadata and absolute pagination links. No credentials
+or live tenant requests are used; this is not a substitute for a live pilot.
+
 ## Protect runtime data
 
 **Do not commit or publicly share generated backups, audits, exports,
