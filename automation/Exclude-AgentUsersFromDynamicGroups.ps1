@@ -163,13 +163,15 @@ Takes precedence over -Detailed.
 .PARAMETER Detailed
 Expands the summary with every group's result, processing state, original and
 proposed rules, the result legend, and reasons/next steps for all skipped groups.
-Without this switch, only totals and manual-review groups with their reasons
-and next steps are displayed. Alias: -Details.
+Without this switch, a short applied/already-saved summary and manual-review
+reasons are displayed. Full next steps and the parameter guide are shown only
+with this switch. Alias: -Details.
 .PARAMETER NoMenu
 Skips the interactive Read-Host menu. Use for unattended execution.
 -PassThru also skips the menu. Menu options view all groups in the connected
-tenant, apply to explicitly entered group IDs, refresh the current scope, or
-exit. Choosing apply may request write permission after read-only sign-in;
+tenant, apply to eligible groups using ALL, numbered selection, or GUIDs,
+refresh the current scope, or exit. Choosing apply may request write permission
+if an existing connection is read-only;
 required consent and per-group confirmation are not bypassed.
 .PARAMETER MaxRetry
 Maximum additional attempts per request. Default 5; allowed 0-10.
@@ -271,7 +273,10 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-Write-Host 'EXPERIMENTAL SAMPLE - evaluation/testing only. AS IS; no warranties. Not production-ready.' -ForegroundColor Yellow
+$isMenuAction = $MyInvocation.ScriptName -eq $PSCommandPath
+if (-not $isMenuAction) {
+    Write-Host 'EXPERIMENTAL SAMPLE - evaluation/testing only. AS IS; no warranties. Not production-ready.' -ForegroundColor Yellow
+}
 $requiresWrite = $Apply -and -not $WhatIfPreference
 $requiredScope = if ($requiresWrite) { 'Group.ReadWrite.All' } else { 'Group.Read.All' }
 $interactiveApply = -not $NoMenu -and -not $PassThru -and -not $WhatIfPreference
@@ -322,12 +327,18 @@ $matchedScopes = @($grantedScopes | Where-Object { $_ -in $acceptedScopes })
 if ($matchedScopes.Count -eq 0) {
     throw "Cannot verify required Microsoft Graph permission '$requiredScope' in Get-MgContext.Scopes. No changes were made. Obtain admin consent, then reconnect, for example: Disconnect-MgGraph; Connect-MgGraph -TenantId '$($context.TenantId)' -Scopes '$requiredScope' -ContextScope Process. Sessions reporting only .default or no named permissions are not supported. For delegated apply, also verify an active authorized Entra role or group ownership; this check does not verify effective write authorization."
 }
-Write-Host "Tenant: $($context.TenantId). Apply: $Apply. Review skipped groups in the output."
-Write-Host "Permission preflight: session reports $($matchedScopes -join ', '). Effective authorization is enforced by Microsoft Graph."
+if (-not $isMenuAction) {
+    Write-Host "Connected tenant: $($context.TenantId)"
+    if ($Detailed) {
+        Write-Host "Permission preflight: session reports $($matchedScopes -join ', '). Effective authorization is enforced by Microsoft Graph."
+    }
+}
 if ($requiresWrite) {
     Write-Warning 'Apply can change access, group-based licensing, and security/compliance policy coverage. Verify active Entra authorization (including PIM where applicable), group dependencies, and change approval. Directory roles and group-specific write access have not been prevalidated.'
 }
-Write-Warning 'Confirm Entra support and validate representative human and agent accounts before applying. Coverage after parent identity or blueprint deletion is not established by this script.'
+if (-not $isMenuAction) {
+    Write-Warning 'Confirm Entra support and validate representative human and agent accounts before applying. Coverage after parent identity or blueprint deletion is not established by this script.'
+}
 
 $graphSession = [Microsoft.Graph.PowerShell.Authentication.GraphSession]::Instance
 $sdkEnvironment = $graphSession.Environment
@@ -544,7 +555,7 @@ $plan = @(
                 }
             }
         }
-        if ($status -eq 'Skipped' -and ($Detailed -or $PassThru)) {
+        if (-not $isMenuAction -and $status -eq 'Skipped' -and ($Detailed -or $PassThru)) {
             Write-Warning "$($group.displayName) [$($group.id)]: $reason"
         }
         [pscustomobject]@{
@@ -769,6 +780,57 @@ if ($PassThru) {
         Write-Host $text.TrimEnd() -ForegroundColor $Color
     }
 
+    function Write-GroupSummary {
+        param([object[]] $Rows)
+        $updated = @($Rows | Where-Object Status -eq 'Updated').Count
+        $saved = @($Rows | Where-Object Status -eq 'Unchanged').Count
+        $eligible = @($Rows | Where-Object Status -eq 'Preview').Count
+        $notApplied = @($Rows | Where-Object Status -eq 'NotApplied').Count
+        $notApplicable = @($Rows | Where-Object ReviewCategory -eq 'NotApplicable').Count
+        $manualReview = @($Rows | Where-Object ReviewCategory -eq 'ManualReview')
+        $paused = @($Rows | Where-Object ProcessingState -eq 'Paused').Count
+        $ruleLabel = if ($updated -eq 1) { 'group rule' } else { 'group rules' }
+        $changeLabel = if ($eligible -eq 1) { 'eligible rule change' } else { 'eligible rule changes' }
+        $groupLabel = if ($saved -eq 1) { 'group' } else { 'groups' }
+        Write-Host ''
+        Write-Host 'AGENT USER EXCLUSION - SUMMARY' -ForegroundColor Cyan
+        if ($WhatIfPreference) {
+            Write-Host 'WHATIF: no changes applied.' -ForegroundColor Cyan
+        } elseif ($updated -gt 0) {
+            Write-Host "APPLIED: $updated $ruleLabel updated and read-back verified." -ForegroundColor Green
+        } elseif ($eligible -gt 0) {
+            Write-Host "PREVIEW ONLY: $eligible $changeLabel. Nothing applied." -ForegroundColor Cyan
+        } elseif ($saved -gt 0) {
+            Write-Host "ALREADY SAVED: exclusion present in $saved $groupLabel. No new eligible changes." -ForegroundColor Green
+        } else {
+            Write-Host 'NO AUTOMATIC CHANGES: no eligible rule changes found.' -ForegroundColor Yellow
+        }
+        Write-Host "Reviewed: $($Rows.Count) | Updated: $updated | Already saved: $saved | Eligible: $eligible"
+        Write-Host "Not applicable: $notApplicable | Manual review: $($manualReview.Count) | Not applied: $notApplied"
+        if ($paused -gt 0) {
+            Write-Host "Paused groups: $paused (processing state preserved)" -ForegroundColor Yellow
+        }
+        if ($manualReview.Count -gt 0) {
+            Write-Host 'MANUAL REVIEW - these groups were NOT changed:' -ForegroundColor Yellow
+            $groupWidth = [Math]::Max(12, [int][Math]::Floor(($reportWidth - 2) * 0.35))
+            Write-ReportTable -Rows $manualReview -Columns @(
+                @{ Label = 'Group'; Expression = 'DisplayName'; Width = $groupWidth }
+                @{ Label = 'Reason'; Expression = 'Reason'; Width = [Math]::Max(12, $reportWidth - $groupWidth - 2) }
+            ) -Color Yellow
+            Write-Host 'Inspect full rules and next steps with option 1 or -Details before changing flagged groups.' -ForegroundColor Yellow
+        }
+        Write-Host 'Saved rules do not confirm completed membership processing. Verify actual membership in Entra.' -ForegroundColor Yellow
+        if ($retryStatistics.Count -gt 0) { Write-Host "Request retries: $($retryStatistics.Count)" -ForegroundColor Gray }
+        $recovered = @($Rows | Where-Object ResponseRecovered).Count
+        if ($recovered -gt 0) { Write-Host "Uncertain PATCH responses reconciled by read-back: $recovered" -ForegroundColor Gray }
+    }
+
+    if (-not $Detailed) {
+        Write-GroupSummary -Rows $plan
+        if ($backupWritten) { Write-Host "Backup: $resolvedBackup" }
+        if ($resolvedAudit) { Write-Host "Audit: $resolvedAudit" }
+        Write-Host 'Full details and help: -Details (menu option 1).'
+    } else {
     $previewCount = @($plan | Where-Object Status -eq 'Preview').Count
     $updatedCount = @($plan | Where-Object Status -eq 'Updated').Count
     $unchangedCount = @($plan | Where-Object Status -eq 'Unchanged').Count
@@ -962,6 +1024,7 @@ if ($PassThru) {
         @{ Expression = 'Purpose'; Width = [Math]::Max(12, $reportWidth - 18) }
     )
     Write-Host '  Full help: Get-Help .\Exclude-AgentUsersFromDynamicGroups.ps1 -Full' -ForegroundColor Gray
+    }
 }
 
 if (-not $NoMenu -and -not $PassThru) {
@@ -996,12 +1059,11 @@ if (-not $NoMenu -and -not $PassThru) {
             if ($GroupId) { $reviewParameters.GroupId = $GroupId }
             $currentReview = @(& $PSCommandPath @reviewParameters)
             $eligibleGroups = @($currentReview | Where-Object Status -eq 'Preview' | Sort-Object DisplayName, Id)
-            Write-Host "Current scope: $($currentReview.Count) groups reviewed; $($eligibleGroups.Count) eligible rule changes." -ForegroundColor Cyan
-            Write-Host 'Already-excluded, not-applicable, and manual-review groups are not included. Eligibility is checked again before applying.' -ForegroundColor Yellow
+            Write-GroupSummary -Rows $currentReview
             if ($eligibleGroups.Count -eq 0) {
-                Write-Host 'No eligible rule changes remain in this scope. No changes requested.' -ForegroundColor Gray
                 continue
             }
+            Write-Host 'Selection includes eligible changes only; already-saved, not-applicable, and manual-review groups are excluded.' -ForegroundColor Yellow
             Write-Host 'Enter ALL to apply to every eligible group in this scope, or LIST to choose groups by number. Group GUIDs are also accepted for groups in this review.' -ForegroundColor Cyan
             $inputIds = Read-Host 'Enter ALL, LIST, or group GUIDs separated by commas (blank cancels)'
             $numberSelection = $false
