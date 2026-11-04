@@ -132,6 +132,14 @@ automatically undo earlier verified changes.
 
 ## Parameters and reporting
 
+Normal output uses a compact **APPLIED**, **ALREADY SAVED**, **PREVIEW ONLY**,
+or **NO AUTOMATIC CHANGES** summary. New read-back-verified updates and
+exclusions already present have separate counts. Manual-review names and
+reasons remain visible; device/non-applicable groups are counted without
+individual warnings. Menu refreshes do not repeat startup messages, but still
+enforce permission and tenant checks. Use option **1** or `-Details` for full
+rules, IDs, explanations, next steps, and the parameter guide.
+
 The interactive menu includes **Apply all eligible groups or select from a
 numbered list**. Choose that action, then enter `ALL`, `LIST`, or eligible
 group GUIDs. `LIST` shows names, IDs, and processing states; select numbers
